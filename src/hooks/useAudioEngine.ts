@@ -1,7 +1,34 @@
 import { useEffect, useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { usePlayerStore, Track } from '../store/usePlayerStore';
+import { usePlayerStore, Track, AudioDspConfig } from '../store/usePlayerStore';
+
+interface BackendDspConfig {
+  pure_mode: boolean;
+  voice_boost: boolean;
+  spatial_widener: boolean;
+  cheap_headphones: boolean;
+  bass_enhancer: boolean;
+  crossfeed: boolean;
+  stereo_width: number;
+  output_trim_db: number;
+  mode: string;
+  eq_sub_bass: number;
+  eq_mid_bass: number;
+  eq_vocal: number;
+  eq_presence: number;
+  eq_air: number;
+}
+
+interface BackendAudioMeters {
+  peak_left: number;
+  peak_right: number;
+  rms_left: number;
+  rms_right: number;
+  correlation: number;
+  limiter_activity: number;
+  clipping: boolean;
+}
 
 interface BackendPlaybackState {
   is_playing: boolean;
@@ -13,9 +40,44 @@ interface BackendPlaybackState {
   track_finished: boolean;
   dolby_dialog: boolean;
   dolby_spatial: boolean;
+  dsp_config: BackendDspConfig;
 }
 
 const AUDIO_EXTENSIONS = ['mp3', 'flac', 'wav', 'ogg', 'aac', 'm4a', 'opus'];
+
+const fromBackendDspConfig = (config: BackendDspConfig): AudioDspConfig => ({
+  pureMode: config.pure_mode,
+  voiceBoost: config.voice_boost,
+  spatialWidener: config.spatial_widener,
+  cheapHeadphones: config.cheap_headphones,
+  bassEnhancer: config.bass_enhancer,
+  crossfeed: config.crossfeed,
+  stereoWidth: config.stereo_width,
+  outputTrimDb: config.output_trim_db,
+  mode: config.mode,
+  eqSubBass: config.eq_sub_bass,
+  eqMidBass: config.eq_mid_bass,
+  eqVocal: config.eq_vocal,
+  eqPresence: config.eq_presence,
+  eqAir: config.eq_air,
+});
+
+const toBackendDspConfig = (config: AudioDspConfig): BackendDspConfig => ({
+  pure_mode: config.pureMode,
+  voice_boost: config.voiceBoost,
+  spatial_widener: config.spatialWidener,
+  cheap_headphones: config.cheapHeadphones,
+  bass_enhancer: config.bassEnhancer,
+  crossfeed: config.crossfeed,
+  stereo_width: config.stereoWidth,
+  output_trim_db: config.outputTrimDb,
+  mode: config.mode,
+  eq_sub_bass: config.eqSubBass,
+  eq_mid_bass: config.eqMidBass,
+  eq_vocal: config.eqVocal,
+  eq_presence: config.eqPresence,
+  eq_air: config.eqAir,
+});
 
 export const useAudioEngine = () => {
   const {
@@ -27,6 +89,7 @@ export const useAudioEngine = () => {
     shuffle,
     dolbyDialog,
     dolbySpatial,
+    dspConfig,
     playlist,
     setIsPlaying,
     setCurrentTrack,
@@ -35,6 +98,7 @@ export const useAudioEngine = () => {
     setRepeatMode,
     setShuffle,
     setDolbyFeatures,
+    setDspConfig,
     addTrack,
     isImporting,
     setImporting,
@@ -92,6 +156,15 @@ export const useAudioEngine = () => {
       console.error('Failed to set Dolby features:', error);
     }
   }, [setDolbyFeatures]);
+
+  const updateDspConfig = useCallback(async (nextConfig: AudioDspConfig) => {
+    try {
+      await invoke('set_dsp_config', { dspConfig: toBackendDspConfig(nextConfig) });
+      setDspConfig(nextConfig);
+    } catch (error) {
+      console.error('Failed to update DSP config:', error);
+    }
+  }, [setDspConfig]);
 
   const playTrackAtIndex = useCallback(async (index: number) => {
     try {
@@ -198,7 +271,7 @@ export const useAudioEngine = () => {
         await invoke('set_volume', { volume: store.volume });
         await invoke('set_repeat_mode', { mode: store.repeatMode });
         await invoke('set_shuffle', { enabled: store.shuffle });
-        await invoke('set_dolby_features', { dialog: store.dolbyDialog, spatial: store.dolbySpatial });
+        await invoke('set_dsp_config', { dspConfig: toBackendDspConfig(store.dspConfig) });
         console.log('[AUDIO ENGINE] Successfully synchronized persisted state to backend');
       } catch (err) {
         console.error('[AUDIO ENGINE] Failed to sync persisted state:', err);
@@ -219,8 +292,7 @@ export const useAudioEngine = () => {
         setCurrentPosition(state.current_position);
         setIsPlaying(state.is_playing);
         setCurrentTrack(state.current_track);
-        // Sync Dolby states
-        usePlayerStore.getState().setDolbyFeatures(state.dolby_dialog, state.dolby_spatial);
+        usePlayerStore.getState().setDspConfig(fromBackendDspConfig(state.dsp_config));
       } catch {
         // Silently ignore backend polling errors
       }
@@ -228,6 +300,30 @@ export const useAudioEngine = () => {
 
     return () => clearInterval(interval);
   }, [isSynced, setCurrentPosition, setIsPlaying, setCurrentTrack]);
+
+  // Poll audio meters at a faster cadence for responsive metering
+  useEffect(() => {
+    if (!isSynced) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const m = await invoke<BackendAudioMeters>('get_audio_meters');
+        usePlayerStore.getState().setAudioMeters({
+          peakLeft: m.peak_left,
+          peakRight: m.peak_right,
+          rmsLeft: m.rms_left,
+          rmsRight: m.rms_right,
+          correlation: m.correlation,
+          limiterActivity: m.limiter_activity,
+          clipping: m.clipping,
+        });
+      } catch {
+        // Silently ignore backend polling errors
+      }
+    }, 120);
+
+    return () => clearInterval(interval);
+  }, [isSynced]);
 
   return {
     isPlaying,
@@ -238,6 +334,7 @@ export const useAudioEngine = () => {
     shuffle,
     dolbyDialog,
     dolbySpatial,
+    dspConfig,
     playlist,
     isImporting,
     togglePlayback,
@@ -246,6 +343,7 @@ export const useAudioEngine = () => {
     setRepeat,
     toggleShuffle,
     toggleDolby,
+    updateDspConfig,
     playTrackAtIndex,
     nextTrack,
     prevTrack,

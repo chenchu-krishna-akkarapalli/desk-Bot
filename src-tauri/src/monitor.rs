@@ -565,7 +565,7 @@ fn scan_antivirus_recursive(
     max_depth: usize,
     threats: &mut Vec<AntivirusThreat>,
     scanned_count: &mut usize,
-    window: &tauri::Window,
+    app_handle: &tauri::AppHandle,
 ) {
     if depth > max_depth {
         return;
@@ -585,14 +585,14 @@ fn scan_antivirus_recursive(
                 if file_name == "node_modules" || file_name == "target" || file_name == "build" || file_name == ".git" {
                     continue;
                 }
-                scan_antivirus_recursive(&entry_path, depth + 1, max_depth, threats, scanned_count, window);
+                scan_antivirus_recursive(&entry_path, depth + 1, max_depth, threats, scanned_count, app_handle);
             } else if file_type.is_file() {
                 *scanned_count += 1;
                 let path_str = entry_path.to_string_lossy().into_owned();
 
                 // Stream current path log back to the UI
                 use tauri::Emitter;
-                let _ = window.emit("antivirus-scan-log", path_str.clone());
+                let _ = app_handle.emit("antivirus-scan-log", path_str.clone());
 
                 let metadata = match entry.metadata() {
                     Ok(m) => m,
@@ -697,7 +697,7 @@ fn scan_antivirus_recursive(
 }
 
 #[tauri::command]
-pub fn run_antivirus_scan(window: tauri::Window, scan_path: String) -> Result<AntivirusScanReport, String> {
+pub fn run_antivirus_scan(app_handle: tauri::AppHandle, scan_path: String) -> Result<AntivirusScanReport, String> {
     let path = std::path::Path::new(&scan_path);
     if !path.exists() {
         return Err("Directory does not exist".to_string());
@@ -710,7 +710,7 @@ pub fn run_antivirus_scan(window: tauri::Window, scan_path: String) -> Result<An
     let mut threats = Vec::new();
     let mut scanned_files_count = 0;
 
-    scan_antivirus_recursive(path, 0, 4, &mut threats, &mut scanned_files_count, &window);
+    scan_antivirus_recursive(path, 0, 4, &mut threats, &mut scanned_files_count, &app_handle);
 
     let elapsed_seconds = start_time.elapsed().as_secs_f32();
 

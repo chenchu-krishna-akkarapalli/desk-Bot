@@ -109,7 +109,7 @@ fn is_likely_password(text: &str) -> bool {
 }
 
 pub fn start_clipboard_monitor(app_handle: tauri::AppHandle) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let api_key_regex = Regex::new(r"(?i)(?:key|secret|token|password|passwd|sk-proj-|ghp_|pwd_)[a-zA-Z0-9_\-\.]{12,}").unwrap();
         let credit_card_regex = Regex::new(r"\b(?:\d[ -]*?){13,16}\b").unwrap();
         
@@ -217,7 +217,7 @@ pub fn start_clipboard_monitor(app_handle: tauri::AppHandle) {
                 let delay = config.clear_delay_secs;
                 let app_handle_clone = app_handle.clone();
                 
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     tokio::select! {
                         _ = tokio::time::sleep(Duration::from_secs(delay)) => {
                             // Clear Clipboard

@@ -163,7 +163,7 @@ export default function ClipboardShield() {
 
         <div className="flex items-center gap-2.5 mt-5 z-10">
           <button
-            onClick={force_clear_clipboard}
+            onClick={forceClear}
             className="px-4 py-2 text-xs rounded-full font-bold bg-rose-500/10 border border-rose-500/20 hover:bg-rose-500/20 text-rose-400 transition cursor-pointer flex items-center gap-1.5 shrink-0"
           >
             <Trash2 size={13} />

@@ -4,6 +4,8 @@ import StorageCard from './StorageCard';
 import SettingsGear from './SettingsGear';
 import ScanningPanel from './WorkspaceCleaner/ScanningPanel';
 import ClipboardShield from './ClipboardShield';
+import UsbShield from './UsbShield';
+import SandboxPanel from './SandboxPanel';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { useScreenTime } from '../hooks/useScreenTime';
 import { usePlayerStore } from '../store/usePlayerStore';
@@ -783,6 +785,10 @@ export default function Dashboard() {
           <ScanningPanel />
           <div className="border-t border-white/5 my-2" />
           <ClipboardShield />
+          <div className="border-t border-white/5 my-2" />
+          <UsbShield />
+          <div className="border-t border-white/5 my-2" />
+          <SandboxPanel />
         </div>
       )}
 

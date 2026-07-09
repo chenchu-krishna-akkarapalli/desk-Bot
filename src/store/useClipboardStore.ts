@@ -21,7 +21,8 @@ interface ClipboardState {
   logs: ClipboardShieldLog[];
   countdown: number;
   isCountdownActive: boolean;
-  intervalId: NodeJS.Timeout | null;
+  intervalId: any;
+
 
   fetchConfig: () => Promise<void>;
   updateConfig: (configUpdates: Partial<ClipboardConfig>) => Promise<void>;

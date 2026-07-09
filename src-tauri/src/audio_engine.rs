@@ -1,6 +1,7 @@
+use std::f32::consts::PI;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -16,53 +17,546 @@ pub struct AudioOutputStream(pub rodio::OutputStream);
 unsafe impl Send for AudioOutputStream {}
 unsafe impl Sync for AudioOutputStream {}
 
-// Dolby Audio Processing Source wrapper
-pub struct DolbySource<I>
+/// Number of frames accumulated in the audio thread before a meter block is
+/// published. ~2048 frames ≈ 46 ms at 44.1 kHz — responsive without spamming.
+const METER_BLOCK_FRAMES: u32 = 2048;
+
+/// Lock-free telemetry shared between the real-time DSP thread (writer) and the
+/// UI polling thread (reader). Values are stored as `f32` bit patterns in
+/// atomics; the audio thread only ever does a handful of relaxed stores per
+/// block, so it never blocks the playback callback.
+#[derive(Default)]
+pub struct AudioMeters {
+    peak_left: AtomicU32,
+    peak_right: AtomicU32,
+    rms_left: AtomicU32,
+    rms_right: AtomicU32,
+    correlation: AtomicU32,
+    /// Fraction of frames in the last block where the limiter was engaged.
+    limiter_activity: AtomicU32,
+    /// True if any sample in the last block reached full scale.
+    clipping: AtomicBool,
+}
+
+impl AudioMeters {
+    fn store_f32(cell: &AtomicU32, value: f32) {
+        cell.store(value.to_bits(), Ordering::Relaxed);
+    }
+
+    fn load_f32(cell: &AtomicU32) -> f32 {
+        f32::from_bits(cell.load(Ordering::Relaxed))
+    }
+
+    fn publish(&self, peak_l: f32, peak_r: f32, rms_l: f32, rms_r: f32, corr: f32, limiter: f32, clip: bool) {
+        Self::store_f32(&self.peak_left, peak_l);
+        Self::store_f32(&self.peak_right, peak_r);
+        Self::store_f32(&self.rms_left, rms_l);
+        Self::store_f32(&self.rms_right, rms_r);
+        Self::store_f32(&self.correlation, corr);
+        Self::store_f32(&self.limiter_activity, limiter);
+        self.clipping.store(clip, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> AudioMetersSnapshot {
+        AudioMetersSnapshot {
+            peak_left: Self::load_f32(&self.peak_left),
+            peak_right: Self::load_f32(&self.peak_right),
+            rms_left: Self::load_f32(&self.rms_left),
+            rms_right: Self::load_f32(&self.rms_right),
+            correlation: Self::load_f32(&self.correlation),
+            limiter_activity: Self::load_f32(&self.limiter_activity),
+            clipping: self.clipping.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Zero all meters — used when playback is stopped so the UI decays to rest
+    /// instead of freezing on the last block's values.
+    pub fn reset(&self) {
+        self.publish(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioMetersSnapshot {
+    /// Linear peak (0..1) per channel over the last block.
+    pub peak_left: f32,
+    pub peak_right: f32,
+    /// Linear RMS (0..1) per channel — a simple loudness proxy.
+    pub rms_left: f32,
+    pub rms_right: f32,
+    /// Stereo correlation coefficient (-1 = anti-phase, 0 = wide, 1 = mono).
+    pub correlation: f32,
+    /// 0..1 fraction of the last block where the limiter was working.
+    pub limiter_activity: f32,
+    /// True if the signal hit full scale in the last block.
+    pub clipping: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioDspConfig {
+    /// When true the DSP graph is fully bypassed and audio passes through
+    /// bit-for-bit. This is the `Reference` signal path.
+    pub pure_mode: bool,
+    pub voice_boost: bool,
+    pub spatial_widener: bool,
+    pub cheap_headphones: bool,
+    pub bass_enhancer: bool,
+    /// Headphone crossfeed — bleeds a low-passed portion of the opposite
+    /// channel to relax hard-panned stereo for a more natural, speaker-like
+    /// image over headphones. Mono-compatible.
+    #[serde(default)]
+    pub crossfeed: bool,
+    /// Stereo width multiplier applied to the side (L-R) component.
+    /// 1.0 = untouched, <1.0 narrows toward mono, >1.0 widens.
+    /// Safety-clamped in the engine.
+    #[serde(default = "default_stereo_width")]
+    pub stereo_width: f32,
+    /// Output headroom / makeup trim in dB applied just before the limiter.
+    /// Negative values reserve headroom before enhancement peaks.
+    #[serde(default)]
+    pub output_trim_db: f32,
+    /// Active listening-mode label (policy bundle id). Purely descriptive:
+    /// the actual processing is driven by the granular flags above so the
+    /// real-time path stays deterministic and user overrides always win.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    pub eq_sub_bass: f32,
+    pub eq_mid_bass: f32,
+    pub eq_vocal: f32,
+    pub eq_presence: f32,
+    pub eq_air: f32,
+}
+
+fn default_stereo_width() -> f32 {
+    1.35
+}
+
+fn default_mode() -> String {
+    "custom".to_string()
+}
+
+impl Default for AudioDspConfig {
+    fn default() -> Self {
+        Self {
+            pure_mode: false,
+            voice_boost: true,
+            spatial_widener: true,
+            cheap_headphones: true,
+            bass_enhancer: true,
+            crossfeed: false,
+            stereo_width: default_stereo_width(),
+            output_trim_db: 0.0,
+            mode: default_mode(),
+            eq_sub_bass: 0.0,
+            eq_mid_bass: 0.0,
+            eq_vocal: 0.0,
+            eq_presence: 0.0,
+            eq_air: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BiquadCoefficients {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BiquadState {
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+#[derive(Clone, Copy)]
+struct StereoBiquad {
+    coeffs: BiquadCoefficients,
+    left: BiquadState,
+    right: BiquadState,
+}
+
+impl StereoBiquad {
+    fn new(coeffs: BiquadCoefficients) -> Self {
+        Self {
+            coeffs,
+            left: BiquadState::default(),
+            right: BiquadState::default(),
+        }
+    }
+
+    fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
+        (
+            process_biquad_sample(left, &self.coeffs, &mut self.left),
+            process_biquad_sample(right, &self.coeffs, &mut self.right),
+        )
+    }
+}
+
+fn process_biquad_sample(sample: f32, coeffs: &BiquadCoefficients, state: &mut BiquadState) -> f32 {
+    let y = coeffs.b0 * sample
+        + coeffs.b1 * state.x1
+        + coeffs.b2 * state.x2
+        - coeffs.a1 * state.y1
+        - coeffs.a2 * state.y2;
+
+    state.x2 = state.x1;
+    state.x1 = sample;
+    state.y2 = state.y1;
+    state.y1 = y;
+
+    y
+}
+
+/// Amplitude factor used inside the RBJ biquad formulas (A = sqrt(linear gain)).
+fn db_to_gain(db: f32) -> f32 {
+    10.0_f32.powf(db / 40.0)
+}
+
+/// Straight linear voltage gain from decibels (10^(dB/20)).
+fn db_to_linear_gain(db: f32) -> f32 {
+    10.0_f32.powf(db / 20.0)
+}
+
+fn normalize_coefficients(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> BiquadCoefficients {
+    BiquadCoefficients {
+        b0: b0 / a0,
+        b1: b1 / a0,
+        b2: b2 / a0,
+        a1: a1 / a0,
+        a2: a2 / a0,
+    }
+}
+
+fn peaking_eq(sample_rate: u32, frequency: f32, q: f32, gain_db: f32) -> BiquadCoefficients {
+    let omega = 2.0 * PI * frequency / sample_rate as f32;
+    let alpha = omega.sin() / (2.0 * q);
+    let a = db_to_gain(gain_db);
+    let cos_omega = omega.cos();
+
+    normalize_coefficients(
+        1.0 + alpha * a,
+        -2.0 * cos_omega,
+        1.0 - alpha * a,
+        1.0 + alpha / a,
+        -2.0 * cos_omega,
+        1.0 - alpha / a,
+    )
+}
+
+fn low_shelf(sample_rate: u32, frequency: f32, slope: f32, gain_db: f32) -> BiquadCoefficients {
+    let omega = 2.0 * PI * frequency / sample_rate as f32;
+    let a = db_to_gain(gain_db);
+    let cos_omega = omega.cos();
+    let sin_omega = omega.sin();
+    let two_sqrt_a_alpha = sin_omega / 2.0 * (((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0).max(0.0)).sqrt();
+
+    normalize_coefficients(
+        a * ((a + 1.0) - (a - 1.0) * cos_omega + two_sqrt_a_alpha),
+        2.0 * a * ((a - 1.0) - (a + 1.0) * cos_omega),
+        a * ((a + 1.0) - (a - 1.0) * cos_omega - two_sqrt_a_alpha),
+        (a + 1.0) + (a - 1.0) * cos_omega + two_sqrt_a_alpha,
+        -2.0 * ((a - 1.0) + (a + 1.0) * cos_omega),
+        (a + 1.0) + (a - 1.0) * cos_omega - two_sqrt_a_alpha,
+    )
+}
+
+fn high_shelf(sample_rate: u32, frequency: f32, slope: f32, gain_db: f32) -> BiquadCoefficients {
+    let omega = 2.0 * PI * frequency / sample_rate as f32;
+    let a = db_to_gain(gain_db);
+    let cos_omega = omega.cos();
+    let sin_omega = omega.sin();
+    let two_sqrt_a_alpha = sin_omega / 2.0 * (((a + 1.0 / a) * (1.0 / slope - 1.0) + 2.0).max(0.0)).sqrt();
+
+    normalize_coefficients(
+        a * ((a + 1.0) + (a - 1.0) * cos_omega + two_sqrt_a_alpha),
+        -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_omega),
+        a * ((a + 1.0) + (a - 1.0) * cos_omega - two_sqrt_a_alpha),
+        (a + 1.0) - (a - 1.0) * cos_omega + two_sqrt_a_alpha,
+        2.0 * ((a - 1.0) - (a + 1.0) * cos_omega),
+        (a + 1.0) - (a - 1.0) * cos_omega - two_sqrt_a_alpha,
+    )
+}
+
+struct DspChain {
+    config: AudioDspConfig,
+    compensation_low: StereoBiquad,
+    compensation_mud: StereoBiquad,
+    compensation_high: StereoBiquad,
+    eq_sub: StereoBiquad,
+    eq_mid_bass: StereoBiquad,
+    eq_vocal: StereoBiquad,
+    eq_presence: StereoBiquad,
+    eq_air: StereoBiquad,
+    voice_boost: StereoBiquad,
+    bass_low_pass_left: f32,
+    bass_low_pass_right: f32,
+    bass_low_pass_alpha: f32,
+    // Crossfeed one-pole low-pass state (opposite-channel bleed).
+    cross_low_pass_left: f32,
+    cross_low_pass_right: f32,
+    cross_low_pass_alpha: f32,
+    // Precomputed, safety-clamped controls.
+    stereo_width: f32,
+    output_gain: f32,
+    // Metering: accumulated over a block, then published to shared atomics.
+    meters: Arc<AudioMeters>,
+    meter_frames: u32,
+    meter_peak_l: f32,
+    meter_peak_r: f32,
+    meter_sum_l2: f32,
+    meter_sum_r2: f32,
+    meter_sum_lr: f32,
+    meter_limited: u32,
+    meter_clip: bool,
+}
+
+impl DspChain {
+    fn new(sample_rate: u32, config: AudioDspConfig, meters: Arc<AudioMeters>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let dt = 1.0 / sr;
+
+        let one_pole_alpha = |cutoff_hz: f32| {
+            let rc = 1.0 / (2.0 * PI * cutoff_hz);
+            (dt / (rc + dt)).clamp(0.0, 1.0)
+        };
+
+        // Clamp user-facing controls to safe ranges once, outside the hot loop.
+        let stereo_width = config.stereo_width.clamp(0.0, 2.0);
+        let output_gain = db_to_linear_gain(config.output_trim_db.clamp(-24.0, 12.0));
+
+        Self {
+            compensation_low: StereoBiquad::new(low_shelf(sample_rate, 60.0, 0.8, 4.5)),
+            compensation_mud: StereoBiquad::new(peaking_eq(sample_rate, 300.0, 0.9, -3.0)),
+            compensation_high: StereoBiquad::new(high_shelf(sample_rate, 10_000.0, 0.8, 5.0)),
+            eq_sub: StereoBiquad::new(peaking_eq(sample_rate, 60.0, 0.9, config.eq_sub_bass)),
+            eq_mid_bass: StereoBiquad::new(peaking_eq(sample_rate, 250.0, 0.9, config.eq_mid_bass)),
+            eq_vocal: StereoBiquad::new(peaking_eq(sample_rate, 1_000.0, 1.0, config.eq_vocal)),
+            eq_presence: StereoBiquad::new(peaking_eq(sample_rate, 4_000.0, 1.0, config.eq_presence)),
+            eq_air: StereoBiquad::new(peaking_eq(sample_rate, 12_000.0, 0.8, config.eq_air)),
+            voice_boost: StereoBiquad::new(peaking_eq(sample_rate, 2_500.0, 0.8, 3.2)),
+            config,
+            bass_low_pass_left: 0.0,
+            bass_low_pass_right: 0.0,
+            bass_low_pass_alpha: one_pole_alpha(80.0),
+            cross_low_pass_left: 0.0,
+            cross_low_pass_right: 0.0,
+            cross_low_pass_alpha: one_pole_alpha(700.0),
+            stereo_width,
+            output_gain,
+            meters,
+            meter_frames: 0,
+            meter_peak_l: 0.0,
+            meter_peak_r: 0.0,
+            meter_sum_l2: 0.0,
+            meter_sum_r2: 0.0,
+            meter_sum_lr: 0.0,
+            meter_limited: 0,
+            meter_clip: false,
+        }
+    }
+
+    /// Accumulate one output frame into the current meter block and publish a
+    /// snapshot to the shared atomics when the block fills. Real-time safe:
+    /// only floating-point math plus, once per block, a few relaxed stores.
+    fn accumulate_meters(&mut self, left: f32, right: f32, limited: bool) {
+        let abs_l = left.abs();
+        let abs_r = right.abs();
+        self.meter_peak_l = self.meter_peak_l.max(abs_l);
+        self.meter_peak_r = self.meter_peak_r.max(abs_r);
+        self.meter_sum_l2 += left * left;
+        self.meter_sum_r2 += right * right;
+        self.meter_sum_lr += left * right;
+        if limited {
+            self.meter_limited += 1;
+        }
+        if abs_l >= LIMITER_CEILING || abs_r >= LIMITER_CEILING {
+            self.meter_clip = true;
+        }
+        self.meter_frames += 1;
+
+        if self.meter_frames >= METER_BLOCK_FRAMES {
+            let n = self.meter_frames as f32;
+            let rms_l = (self.meter_sum_l2 / n).sqrt();
+            let rms_r = (self.meter_sum_r2 / n).sqrt();
+            let denom = (self.meter_sum_l2 * self.meter_sum_r2).sqrt();
+            let corr = if denom > 1.0e-9 {
+                (self.meter_sum_lr / denom).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let limiter_activity = self.meter_limited as f32 / n;
+
+            self.meters.publish(
+                self.meter_peak_l,
+                self.meter_peak_r,
+                rms_l,
+                rms_r,
+                corr,
+                limiter_activity,
+                self.meter_clip,
+            );
+
+            self.meter_frames = 0;
+            self.meter_peak_l = 0.0;
+            self.meter_peak_r = 0.0;
+            self.meter_sum_l2 = 0.0;
+            self.meter_sum_r2 = 0.0;
+            self.meter_sum_lr = 0.0;
+            self.meter_limited = 0;
+            self.meter_clip = false;
+        }
+    }
+
+    fn process_frame(&mut self, mut left: f32, mut right: f32) -> (f32, f32) {
+        // Reference path: fully transparent, bit-for-bit passthrough. Metering
+        // is passive observation and never alters the signal.
+        if self.config.pure_mode {
+            self.accumulate_meters(left, right, false);
+            return (left, right);
+        }
+
+        if self.config.cheap_headphones {
+            (left, right) = self.compensation_low.process(left, right);
+            (left, right) = self.compensation_mud.process(left, right);
+            (left, right) = self.compensation_high.process(left, right);
+        }
+
+        if self.config.bass_enhancer {
+            self.bass_low_pass_left += self.bass_low_pass_alpha * (left - self.bass_low_pass_left);
+            self.bass_low_pass_right += self.bass_low_pass_alpha * (right - self.bass_low_pass_right);
+
+            let synth_left = synthesize_bass_harmonics(self.bass_low_pass_left);
+            let synth_right = synthesize_bass_harmonics(self.bass_low_pass_right);
+
+            left += synth_left;
+            right += synth_right;
+        }
+
+        (left, right) = self.eq_sub.process(left, right);
+        (left, right) = self.eq_mid_bass.process(left, right);
+        (left, right) = self.eq_vocal.process(left, right);
+        (left, right) = self.eq_presence.process(left, right);
+        (left, right) = self.eq_air.process(left, right);
+
+        if self.config.voice_boost {
+            (left, right) = self.voice_boost.process(left, right);
+        }
+
+        // Crossfeed: relax hard-panned stereo for headphone listening by
+        // bleeding a low-passed portion of the opposite channel. Energy is
+        // renormalized so overall level stays stable and mono-compatible.
+        if self.config.crossfeed {
+            self.cross_low_pass_left +=
+                self.cross_low_pass_alpha * (left - self.cross_low_pass_left);
+            self.cross_low_pass_right +=
+                self.cross_low_pass_alpha * (right - self.cross_low_pass_right);
+
+            const BLEED: f32 = 0.35;
+            let mixed_left = left + BLEED * self.cross_low_pass_right;
+            let mixed_right = right + BLEED * self.cross_low_pass_left;
+            let norm = 1.0 / (1.0 + BLEED);
+            left = mixed_left * norm;
+            right = mixed_right * norm;
+        }
+
+        // Stereo width: scale the side signal, keep the mid intact so mono
+        // fold-down is preserved. width == 1.0 is a no-op.
+        if self.config.spatial_widener && (self.stereo_width - 1.0).abs() > f32::EPSILON {
+            let mid = (left + right) * 0.5;
+            let side = (left - right) * 0.5 * self.stereo_width;
+            left = mid + side;
+            right = mid - side;
+        }
+
+        // Output stage: headroom/makeup trim followed by a transparent
+        // soft-knee limiter that only engages near full scale.
+        left *= self.output_gain;
+        right *= self.output_gain;
+
+        let limited = left.abs() > LIMITER_KNEE || right.abs() > LIMITER_KNEE;
+        let out_left = soft_limit(left);
+        let out_right = soft_limit(right);
+        self.accumulate_meters(out_left, out_right, limited);
+
+        (out_left, out_right)
+    }
+}
+
+fn synthesize_bass_harmonics(sample: f32) -> f32 {
+    let alpha = 0.08;
+    let beta = 0.18;
+    let gamma = 0.10;
+    let harmonic_mix = sample * alpha + sample.powi(2) * beta * sample.signum() + sample.powi(3) * gamma;
+    harmonic_mix.clamp(-0.25, 0.25)
+}
+
+/// Transparent soft-knee limiter. Signal below the knee threshold passes
+/// through unchanged (no coloration of normal-level material); above it, the
+/// remaining range is smoothly compressed toward — but never past — a ceiling
+/// just under full scale. Monotonic and near-C1 continuous at the knee.
+/// Level above which the limiter starts working (and the meter reports it).
+const LIMITER_KNEE: f32 = 0.7;
+/// Absolute ceiling the limiter asymptotes toward, just under full scale.
+const LIMITER_CEILING: f32 = 0.99;
+
+fn soft_limit(sample: f32) -> f32 {
+    let magnitude = sample.abs();
+    if magnitude <= LIMITER_KNEE {
+        return sample;
+    }
+
+    let over = magnitude - LIMITER_KNEE;
+    let headroom = 1.0 - LIMITER_KNEE;
+    let limited = LIMITER_KNEE + (LIMITER_CEILING - LIMITER_KNEE) * (over / (over + headroom));
+    limited.copysign(sample)
+}
+
+pub struct DspSource<I>
 where
     I: Source<Item = f32>,
 {
     input: I,
-    dialog_enhance: Arc<AtomicBool>,
-    spatial_widener: Arc<AtomicBool>,
-    left_prev: f32,
-    right_prev: f32,
+    chain: DspChain,
     right_buffer: Option<f32>,
 }
 
-impl<I> DolbySource<I>
+impl<I> DspSource<I>
 where
     I: Source<Item = f32>,
 {
-    pub fn new(input: I, dialog_enhance: Arc<AtomicBool>, spatial_widener: Arc<AtomicBool>) -> Self {
-        DolbySource {
+    pub fn new(input: I, config: AudioDspConfig) -> Self {
+        Self::with_meters(input, config, Arc::new(AudioMeters::default()))
+    }
+
+    pub fn with_meters(input: I, config: AudioDspConfig, meters: Arc<AudioMeters>) -> Self {
+        let sample_rate = input.sample_rate();
+        Self {
             input,
-            dialog_enhance,
-            spatial_widener,
-            left_prev: 0.0,
-            right_prev: 0.0,
+            chain: DspChain::new(sample_rate, config, meters),
             right_buffer: None,
         }
     }
 }
 
-impl<I> Iterator for DolbySource<I>
+impl<I> Iterator for DspSource<I>
 where
     I: Source<Item = f32>,
 {
     type Item = f32;
 
-    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(r_sample) = self.right_buffer.take() {
-            return Some(r_sample);
+        if let Some(right) = self.right_buffer.take() {
+            return Some(right);
         }
 
         let in_channels = self.input.channels();
-        
-        let (mut l, mut r) = if in_channels == 2 {
-            let sample_l_raw = self.input.next()?;
-            let sample_r_raw = self.input.next()?;
-            (sample_l_raw, sample_r_raw)
+        let (left, right) = if in_channels == 2 {
+            (self.input.next()?, self.input.next()?)
         } else if in_channels == 1 {
             let sample = self.input.next()?;
             (sample, sample)
@@ -70,48 +564,20 @@ where
             return self.input.next();
         };
 
-        let dialog = self.dialog_enhance.load(Ordering::Relaxed);
-        let spatial = self.spatial_widener.load(Ordering::Relaxed);
-
-        // 1. Dolby Dialog Enhancer: Vocal frequency band peaking boost
-        if dialog {
-            let l_high = l - self.left_prev;
-            let r_high = r - self.right_prev;
-            
-            self.left_prev = l;
-            self.right_prev = r;
-
-            l += l_high * 0.45;
-            r += r_high * 0.45;
-        }
-
-        // 2. Dolby Spatial Widener: Mid-Side separation widening
-        if spatial {
-            let mid = (l + r) * 0.707;
-            let side = (l - r) * 0.707;
-            let side_widened = side * 1.45;
-            l = (mid + side_widened) * 0.707;
-            r = (mid - side_widened) * 0.707;
-        }
-
-        l = l.clamp(-1.0, 1.0);
-        r = r.clamp(-1.0, 1.0);
-
-        self.right_buffer = Some(r);
-        Some(l)
+        let (processed_left, processed_right) = self.chain.process_frame(left, right);
+        self.right_buffer = Some(processed_right);
+        Some(processed_left)
     }
 }
 
-impl<I> Source for DolbySource<I>
+impl<I> Source for DspSource<I>
 where
     I: Source<Item = f32>,
 {
-    #[inline]
     fn current_frame_len(&self) -> Option<usize> {
         self.input.current_frame_len()
     }
 
-    #[inline]
     fn channels(&self) -> u16 {
         let chans = self.input.channels();
         if chans == 1 || chans == 2 {
@@ -121,12 +587,10 @@ where
         }
     }
 
-    #[inline]
     fn sample_rate(&self) -> u32 {
         self.input.sample_rate()
     }
 
-    #[inline]
     fn total_duration(&self) -> Option<std::time::Duration> {
         self.input.total_duration()
     }
@@ -156,6 +620,7 @@ pub struct PlaybackState {
     pub track_finished: bool,
     pub dolby_dialog: bool,
     pub dolby_spatial: bool,
+    pub dsp_config: AudioDspConfig,
 }
 
 struct InnerState {
@@ -250,8 +715,7 @@ pub struct AudioEngine {
     sink: Arc<Mutex<Option<Sink>>>,
     stream: Arc<Mutex<Option<AudioOutputStream>>>,
     stream_handle: Arc<Mutex<OutputStreamHandle>>,
-    dolby_dialog: Arc<AtomicBool>,
-    dolby_spatial: Arc<AtomicBool>,
+    meters: Arc<AudioMeters>,
 }
 
 impl Clone for AudioEngine {
@@ -261,17 +725,13 @@ impl Clone for AudioEngine {
             sink: Arc::clone(&self.sink),
             stream: Arc::clone(&self.stream),
             stream_handle: Arc::clone(&self.stream_handle),
-            dolby_dialog: Arc::clone(&self.dolby_dialog),
-            dolby_spatial: Arc::clone(&self.dolby_spatial),
+            meters: Arc::clone(&self.meters),
         }
     }
 }
 
 impl AudioEngine {
     pub fn new(stream: rodio::OutputStream, stream_handle: OutputStreamHandle) -> Self {
-        let dolby_dialog = Arc::new(AtomicBool::new(true));
-        let dolby_spatial = Arc::new(AtomicBool::new(true));
-        
         let engine = AudioEngine {
             inner: Arc::new(Mutex::new(InnerState {
                 playback: PlaybackState {
@@ -284,6 +744,7 @@ impl AudioEngine {
                     track_finished: false,
                     dolby_dialog: true,
                     dolby_spatial: true,
+                    dsp_config: AudioDspConfig::default(),
                 },
                 playlist: Vec::new(),
                 shuffled_indices: Vec::new(),
@@ -294,8 +755,7 @@ impl AudioEngine {
             sink: Arc::new(Mutex::new(None)),
             stream: Arc::new(Mutex::new(Some(AudioOutputStream(stream)))),
             stream_handle: Arc::new(Mutex::new(stream_handle)),
-            dolby_dialog,
-            dolby_spatial,
+            meters: Arc::new(AudioMeters::default()),
         };
 
         // Spawn background auto-advance thread
@@ -327,6 +787,25 @@ impl AudioEngine {
         engine
     }
 
+    pub fn get_meters(&self) -> AudioMetersSnapshot {
+        // When paused/stopped the audio thread isn't producing frames, so the
+        // atomics would freeze on their last block. Report rest instead.
+        let is_playing = self.inner.lock().unwrap().playback.is_playing;
+        if is_playing {
+            self.meters.snapshot()
+        } else {
+            AudioMetersSnapshot {
+                peak_left: 0.0,
+                peak_right: 0.0,
+                rms_left: 0.0,
+                rms_right: 0.0,
+                correlation: 0.0,
+                limiter_activity: 0.0,
+                clipping: false,
+            }
+        }
+    }
+
     pub fn get_state(&self) -> PlaybackState {
         let mut state = {
             let inner = self.inner.lock().unwrap();
@@ -339,7 +818,7 @@ impl AudioEngine {
     }
 
     pub fn play_index(&self, index: usize) -> Result<(), String> {
-        let (track, dialog, spatial) = {
+        let (track, dsp_config) = {
             let mut inner = self.inner.lock().unwrap();
             
             // Stats calculation: increment skip count if previous track was skipped
@@ -361,8 +840,7 @@ impl AudioEngine {
 
             (
                 inner.playlist.get(index).cloned(),
-                inner.playback.dolby_dialog,
-                inner.playback.dolby_spatial
+                inner.playback.dsp_config.clone(),
             )
         };
 
@@ -378,13 +856,7 @@ impl AudioEngine {
             let source = Decoder::new(BufReader::new(file))
                 .map_err(|e| format!("Cannot decode audio: {}", e))?
                 .convert_samples::<f32>();
-            
-            // Wrap source in Dolby Audio Virtualizer
-            let dolby_source = DolbySource::new(
-                source,
-                Arc::clone(&self.dolby_dialog),
-                Arc::clone(&self.dolby_spatial),
-            );
+            let dsp_source = DspSource::with_meters(source, dsp_config, Arc::clone(&self.meters));
 
             let new_sink_res = {
                 let handle_guard = self.stream_handle.lock().unwrap();
@@ -395,13 +867,13 @@ impl AudioEngine {
                 .map_err(|e| format!("Cannot create audio output sink: {}. Please verify your audio output device.", e))?;
 
             println!("[AUDIO ENGINE] Playing track: '{}' from '{}'", track.title, track.path);
-            let in_channels = dolby_source.channels();
-            let sample_rate = dolby_source.sample_rate();
+            let in_channels = dsp_source.channels();
+            let sample_rate = dsp_source.sample_rate();
             println!("[AUDIO ENGINE] Source channels: {}, sample rate: {}", in_channels, sample_rate);
             let volume = self.inner.lock().unwrap().playback.volume;
             println!("[AUDIO ENGINE] Setting volume to: {}", volume);
             new_sink.set_volume(volume);
-            new_sink.append(dolby_source);
+            new_sink.append(dsp_source);
             new_sink.play();
             println!("[AUDIO ENGINE] Sink created and playing!");
 
@@ -415,9 +887,6 @@ impl AudioEngine {
             inner.playback.current_position = 0.0;
             inner.paused_position = 0.0;
             inner.play_start = Some(Instant::now());
-
-            self.dolby_dialog.store(dialog, Ordering::Relaxed);
-            self.dolby_spatial.store(spatial, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -575,9 +1044,19 @@ impl AudioEngine {
         let mut inner = self.inner.lock().unwrap();
         inner.playback.dolby_dialog = dialog;
         inner.playback.dolby_spatial = spatial;
-        
-        self.dolby_dialog.store(dialog, Ordering::Relaxed);
-        self.dolby_spatial.store(spatial, Ordering::Relaxed);
+        inner.playback.dsp_config.voice_boost = dialog;
+        inner.playback.dsp_config.spatial_widener = spatial;
+    }
+
+    pub fn set_dsp_config(&self, dsp_config: AudioDspConfig) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.playback.dolby_dialog = dsp_config.voice_boost;
+        inner.playback.dolby_spatial = dsp_config.spatial_widener;
+        inner.playback.dsp_config = dsp_config;
+    }
+
+    pub fn get_dsp_config(&self) -> AudioDspConfig {
+        self.inner.lock().unwrap().playback.dsp_config.clone()
     }
 
     pub fn toggle_like_track(&self, track_id: &str) -> Result<bool, String> {
@@ -819,6 +1298,24 @@ pub fn set_dolby_features(
 }
 
 #[command]
+pub fn get_audio_meters(engine: tauri::State<Arc<Mutex<AudioEngine>>>) -> AudioMetersSnapshot {
+    engine.lock().unwrap().get_meters()
+}
+
+#[command]
+pub fn get_dsp_config(engine: tauri::State<Arc<Mutex<AudioEngine>>>) -> AudioDspConfig {
+    engine.lock().unwrap().get_dsp_config()
+}
+
+#[command]
+pub fn set_dsp_config(
+    engine: tauri::State<Arc<Mutex<AudioEngine>>>,
+    dsp_config: AudioDspConfig,
+) {
+    engine.lock().unwrap().set_dsp_config(dsp_config);
+}
+
+#[command]
 pub fn sync_playlist_cmd(
     engine: tauri::State<Arc<Mutex<AudioEngine>>>,
     playlist: Vec<Track>,
@@ -838,7 +1335,6 @@ pub fn sync_active_track_cmd(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
 
     struct MockSource {
         samples: Vec<f32>,
@@ -941,6 +1437,11 @@ mod tests {
                 track_finished: false,
                 dolby_dialog: false,
                 dolby_spatial: false,
+                dsp_config: AudioDspConfig {
+                    voice_boost: false,
+                    spatial_widener: false,
+                    ..AudioDspConfig::default()
+                },
             },
             playlist: (0..10).map(|i| Track {
                 id: i.to_string(),
@@ -990,6 +1491,11 @@ mod tests {
                 track_finished: false,
                 dolby_dialog: false,
                 dolby_spatial: false,
+                dsp_config: AudioDspConfig {
+                    voice_boost: false,
+                    spatial_widener: false,
+                    ..AudioDspConfig::default()
+                },
             },
             playlist: (0..3).map(|i| Track {
                 id: i.to_string(),
@@ -1025,14 +1531,20 @@ mod tests {
     }
 
     #[test]
-    fn test_dolby_source_dsp() {
-        let dialog = Arc::new(AtomicBool::new(false));
-        let spatial = Arc::new(AtomicBool::new(false));
-
+    fn test_dsp_source_stability() {
         // 1. Verify Silence input (all 0.0) yields silence output
         let silence_samples = vec![0.0; 100];
         let mock_source = MockSource::new(silence_samples, 2, 44100);
-        let mut dolby_source = DolbySource::new(mock_source, Arc::clone(&dialog), Arc::clone(&spatial));
+        let mut dolby_source = DspSource::new(
+            mock_source,
+            AudioDspConfig {
+                voice_boost: false,
+                spatial_widener: false,
+                cheap_headphones: false,
+                bass_enhancer: false,
+                ..AudioDspConfig::default()
+            },
+        );
         
         let output: Vec<f32> = dolby_source.by_ref().collect();
         assert_eq!(output.len(), 100);
@@ -1041,11 +1553,9 @@ mod tests {
         }
 
         // 2. Verify Silence stability under active dialog/spatial processing
-        dialog.store(true, Ordering::Relaxed);
-        spatial.store(true, Ordering::Relaxed);
         let silence_samples2 = vec![0.0; 100];
         let mock_source2 = MockSource::new(silence_samples2, 2, 44100);
-        let mut dolby_source2 = DolbySource::new(mock_source2, Arc::clone(&dialog), Arc::clone(&spatial));
+        let mut dolby_source2 = DspSource::new(mock_source2, AudioDspConfig::default());
         let output2: Vec<f32> = dolby_source2.by_ref().collect();
         assert_eq!(output2.len(), 100);
         for &sample in &output2 {
@@ -1057,7 +1567,7 @@ mod tests {
         impulse_samples[0] = 1.0; // Left impulse
         impulse_samples[1] = -1.0; // Right impulse
         let mock_source3 = MockSource::new(impulse_samples, 2, 44100);
-        let mut dolby_source3 = DolbySource::new(mock_source3, Arc::clone(&dialog), Arc::clone(&spatial));
+        let mut dolby_source3 = DspSource::new(mock_source3, AudioDspConfig::default());
         let output3: Vec<f32> = dolby_source3.by_ref().collect();
         assert_eq!(output3.len(), 200);
         for &sample in &output3 {
@@ -1065,8 +1575,6 @@ mod tests {
         }
 
         // 4. Verify Voice Boost (Dialog Enhance) does not cause divergence/explode under high frequency inputs
-        dialog.store(true, Ordering::Relaxed);
-        spatial.store(false, Ordering::Relaxed);
         let mut high_freq_samples = Vec::new();
         for i in 0..100 {
             let val = if i % 2 == 0 { 0.8 } else { -0.8 };
@@ -1074,7 +1582,13 @@ mod tests {
             high_freq_samples.push(-val); // Right
         }
         let mock_source4 = MockSource::new(high_freq_samples, 2, 44100);
-        let mut dolby_source4 = DolbySource::new(mock_source4, Arc::clone(&dialog), Arc::clone(&spatial));
+        let mut dolby_source4 = DspSource::new(
+            mock_source4,
+            AudioDspConfig {
+                spatial_widener: false,
+                ..AudioDspConfig::default()
+            },
+        );
         let output4: Vec<f32> = dolby_source4.by_ref().collect();
         assert_eq!(output4.len(), 200);
         for &sample in &output4 {
@@ -1082,8 +1596,6 @@ mod tests {
         }
 
         // 5. Verify Spatial 3D (Spatial Widener) output is stable and properly bounded
-        dialog.store(false, Ordering::Relaxed);
-        spatial.store(true, Ordering::Relaxed);
         let mut spatial_samples = Vec::new();
         for i in 0..100 {
             let val = (i as f32).sin();
@@ -1091,11 +1603,33 @@ mod tests {
             spatial_samples.push(-val);
         }
         let mock_source5 = MockSource::new(spatial_samples, 2, 44100);
-        let mut dolby_source5 = DolbySource::new(mock_source5, Arc::clone(&dialog), Arc::clone(&spatial));
+        let mut dolby_source5 = DspSource::new(
+            mock_source5,
+            AudioDspConfig {
+                voice_boost: false,
+                ..AudioDspConfig::default()
+            },
+        );
         let output5: Vec<f32> = dolby_source5.by_ref().collect();
         assert_eq!(output5.len(), 200);
         for &sample in &output5 {
             assert!(sample >= -1.0 && sample <= 1.0);
         }
+    }
+
+    #[test]
+    fn test_pure_mode_bypasses_processing() {
+        let input_samples = vec![0.25, -0.25, -0.5, 0.5, 0.1, -0.1];
+        let mock_source = MockSource::new(input_samples.clone(), 2, 44100);
+        let output: Vec<f32> = DspSource::new(
+            mock_source,
+            AudioDspConfig {
+                pure_mode: true,
+                ..AudioDspConfig::default()
+            },
+        )
+        .collect();
+
+        assert_eq!(output, input_samples);
     }
 }

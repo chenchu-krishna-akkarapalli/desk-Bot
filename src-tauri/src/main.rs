@@ -5,6 +5,8 @@ mod audio_engine;
 mod monitor;
 mod cleaner;
 mod clipboard;
+mod usb_monitor;
+mod sandbox;
 
 use std::sync::{Arc, Mutex};
 use audio_engine::AudioEngine;
@@ -38,6 +40,8 @@ fn main() {
     let audio_engine = Arc::new(Mutex::new(AudioEngine::new(stream, stream_handle)));
     let monitor_state = MonitorState::new();
     let clipboard_state = clipboard::ClipboardShieldState::new();
+    let usb_state = usb_monitor::UsbShieldState::new();
+    let sandbox_state = sandbox::SandboxState::new();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -45,6 +49,8 @@ fn main() {
         .manage(audio_engine)
         .manage(monitor_state)
         .manage(clipboard_state)
+        .manage(usb_state)
+        .manage(sandbox_state)
         .invoke_handler(tauri::generate_handler![
             // System hooks
             system_hooks::get_idle_time,
@@ -66,6 +72,9 @@ fn main() {
             audio_engine::toggle_like_track,
             audio_engine::set_track_moods,
             audio_engine::set_dolby_features,
+            audio_engine::get_dsp_config,
+            audio_engine::set_dsp_config,
+            audio_engine::get_audio_meters,
             audio_engine::sync_playlist_cmd,
             audio_engine::sync_active_track_cmd,
             // System monitor commands
@@ -95,6 +104,13 @@ fn main() {
             clipboard::update_clipboard_shield_config,
             clipboard::get_clipboard_shield_logs,
             clipboard::force_clear_clipboard,
+            // USB Shield commands
+            usb_monitor::get_usb_shield_config,
+            usb_monitor::update_usb_shield_config,
+            usb_monitor::get_usb_shield_logs,
+            // Sandbox commands
+            sandbox::get_sandbox_logs,
+            sandbox::launch_in_sandbox,
             // Window control commands
             set_window_size,
             set_window_always_on_top,
@@ -108,7 +124,8 @@ fn main() {
         })
         .setup(|app| {
             let app_handle = app.handle().clone();
-            clipboard::start_clipboard_monitor(app_handle);
+            clipboard::start_clipboard_monitor(app_handle.clone());
+            usb_monitor::start_usb_monitor(app_handle);
 
             let show_item = MenuItem::with_id(app, "show", "Show DeskWell", true, None::<&str>)?;
             let hide_item = MenuItem::with_id(app, "hide", "Hide DeskWell", true, None::<&str>)?;
