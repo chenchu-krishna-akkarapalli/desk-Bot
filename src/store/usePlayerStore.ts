@@ -51,6 +51,30 @@ export const emptyMeters: AudioMeters = {
   clipping: false,
 };
 
+/** Coarse output-device classification (mirrors the Rust `DeviceClass`). */
+export type DeviceClass =
+  | 'Unknown'
+  | 'ConsumerHeadphones'
+  | 'GamingHeadset'
+  | 'AudiophileHeadphones'
+  | 'BluetoothEarbuds'
+  | 'StudioMonitors'
+  | 'HomeSpeakers'
+  | 'Soundbar'
+  | 'ExternalDAC'
+  | 'AudioInterface';
+
+/** Resolved profile for the active output device. */
+export interface DeviceProfile {
+  name: string;
+  class: DeviceClass;
+  classLabel: string;
+  description: string;
+  suggestedMode: string;
+  isWireless: boolean;
+  detected: boolean;
+}
+
 /** Signal path derived from the DSP config. */
 export type SignalPath = 'reference' | 'enhanced';
 
@@ -238,6 +262,8 @@ interface PlayerStoreState extends PlaybackState {
   setDspConfig: (config: AudioDspConfig) => void;
   audioMeters: AudioMeters;
   setAudioMeters: (meters: AudioMeters) => void;
+  outputDevice: DeviceProfile | null;
+  setOutputDevice: (device: DeviceProfile | null) => void;
   addTrack: (track: Track) => void;
   setPlaylist: (tracks: Track[]) => void;
   clearPlaylist: () => void;
@@ -331,6 +357,8 @@ export const usePlayerStore = create<PlayerStoreState>()(
   }),
   audioMeters: emptyMeters,
   setAudioMeters: (meters) => set({ audioMeters: meters }),
+  outputDevice: null,
+  setOutputDevice: (device) => set({ outputDevice: device }),
   addTrack: (track) => set((state) => ({ playlist: [...state.playlist, track] })),
   setPlaylist: (tracks) => set({ playlist: tracks }),
   clearPlaylist: () => set({ playlist: [] }),

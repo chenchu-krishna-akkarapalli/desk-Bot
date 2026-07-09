@@ -2,6 +2,7 @@
 
 mod system_hooks;
 mod audio_engine;
+mod device;
 mod monitor;
 mod cleaner;
 mod clipboard;
@@ -75,6 +76,7 @@ fn main() {
             audio_engine::get_dsp_config,
             audio_engine::set_dsp_config,
             audio_engine::get_audio_meters,
+            device::get_output_device,
             audio_engine::sync_playlist_cmd,
             audio_engine::sync_active_track_cmd,
             // System monitor commands

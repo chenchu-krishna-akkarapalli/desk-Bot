@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { usePlayerStore, Track, AudioDspConfig } from '../store/usePlayerStore';
+import { usePlayerStore, Track, AudioDspConfig, DeviceProfile, DeviceClass } from '../store/usePlayerStore';
 
 interface BackendDspConfig {
   pure_mode: boolean;
@@ -29,6 +29,26 @@ interface BackendAudioMeters {
   limiter_activity: number;
   clipping: boolean;
 }
+
+interface BackendDeviceProfile {
+  name: string;
+  class: DeviceClass;
+  class_label: string;
+  description: string;
+  suggested_mode: string;
+  is_wireless: boolean;
+  detected: boolean;
+}
+
+const fromBackendDeviceProfile = (d: BackendDeviceProfile): DeviceProfile => ({
+  name: d.name,
+  class: d.class,
+  classLabel: d.class_label,
+  description: d.description,
+  suggestedMode: d.suggested_mode,
+  isWireless: d.is_wireless,
+  detected: d.detected,
+});
 
 interface BackendPlaybackState {
   is_playing: boolean;
@@ -253,7 +273,21 @@ export const useAudioEngine = () => {
     }
   }, []);
 
+  const detectOutputDevice = useCallback(async () => {
+    try {
+      const profile = await invoke<BackendDeviceProfile>('get_output_device');
+      usePlayerStore.getState().setOutputDevice(fromBackendDeviceProfile(profile));
+    } catch (error) {
+      console.error('Failed to detect output device:', error);
+    }
+  }, []);
+
   const [isSynced, setIsSynced] = useState(false);
+
+  // Detect the active output device once on mount for hardware-aware tuning.
+  useEffect(() => {
+    void detectOutputDevice();
+  }, [detectOutputDevice]);
 
   // Sync persisted Zustand settings/playlist to Rust backend on mount
   useEffect(() => {
@@ -351,5 +385,6 @@ export const useAudioEngine = () => {
     browseAndLoadFolder,
     toggleLike,
     setMoods,
+    detectOutputDevice,
   };
 };

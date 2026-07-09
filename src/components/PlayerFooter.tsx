@@ -18,6 +18,8 @@ import {
   History,
   SlidersHorizontal,
   Waves,
+  Speaker,
+  RefreshCw,
 } from 'lucide-react';
 import { useAudioEngine } from '../hooks/useAudioEngine';
 import {
@@ -54,9 +56,10 @@ const PlayerFooter: React.FC = () => {
     toggleLike,
     setMoods,
     playTrackAtIndex,
+    detectOutputDevice,
   } = useAudioEngine();
 
-  const { searchQuery, setSearchQuery, selectedMood, setSelectedMood, audioMeters } = usePlayerStore();
+  const { searchQuery, setSearchQuery, selectedMood, setSelectedMood, audioMeters, outputDevice } = usePlayerStore();
   const [localVolume, setLocalVolume] = useState(volume);
   const [showPlaylist, setShowPlaylist] = useState(false);
   const [showDspPanel, setShowDspPanel] = useState(false);
@@ -318,6 +321,52 @@ const PlayerFooter: React.FC = () => {
               {LISTENING_MODES.find((m) => m.id === dspConfig.mode)?.description ??
                 'Custom configuration — adjust any control below to fine-tune.'}
             </p>
+          </div>
+
+          {/* Hardware — detected output device + suggested tuning */}
+          <div className="mt-3 flex flex-wrap items-center gap-2 rounded-2xl border border-white/10 bg-white/5 px-3 py-2">
+            <Speaker size={14} className="shrink-0 text-gray-400" />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span className="truncate text-[11px] font-semibold text-white">
+                  {outputDevice?.detected ? outputDevice.name : 'Detecting output device…'}
+                </span>
+                {outputDevice?.detected && (
+                  <span className="shrink-0 rounded-md border border-white/10 bg-black/30 px-1.5 py-0.5 text-[9px] font-medium text-gray-300">
+                    {outputDevice.classLabel}
+                  </span>
+                )}
+                {outputDevice?.isWireless && (
+                  <span className="shrink-0 rounded-md border border-sky-500/30 bg-sky-500/15 px-1.5 py-0.5 text-[9px] font-medium text-sky-300">
+                    Wireless
+                  </span>
+                )}
+              </div>
+              <p className="truncate text-[10px] text-gray-500">
+                {outputDevice?.description ?? 'Reading device capabilities…'}
+              </p>
+            </div>
+            {outputDevice?.detected && (
+              <button
+                onClick={() => applyListeningMode(outputDevice.suggestedMode)}
+                disabled={dspConfig.mode === outputDevice.suggestedMode}
+                className="shrink-0 rounded-lg border border-emerald-500/30 bg-emerald-500/15 px-2.5 py-1 text-[10px] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:cursor-default disabled:opacity-40"
+                title={`Apply the ${
+                  LISTENING_MODES.find((m) => m.id === outputDevice.suggestedMode)?.name ?? 'suggested'
+                } mode for this device`}
+              >
+                {dspConfig.mode === outputDevice.suggestedMode
+                  ? 'Suggested mode active'
+                  : `Apply ${LISTENING_MODES.find((m) => m.id === outputDevice.suggestedMode)?.name ?? 'suggested'}`}
+              </button>
+            )}
+            <button
+              onClick={() => void detectOutputDevice()}
+              className="shrink-0 rounded-lg border border-white/10 bg-white/5 p-1.5 text-gray-400 transition hover:bg-white/10"
+              title="Re-detect output device"
+            >
+              <RefreshCw size={12} />
+            </button>
           </div>
 
           <div className="mt-3 grid gap-3 lg:grid-cols-[1.4fr_2fr]">
