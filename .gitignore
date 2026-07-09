@@ -1,0 +1,16 @@
+node_modules/
+dist/
+src-tauri/target/
+
+.DS_Store
+Thumbs.db
+
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+.env
+.env.*
+!.env.example

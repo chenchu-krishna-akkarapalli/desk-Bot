@@ -1,0 +1,223 @@
+@import "tailwindcss";
+
+:root {
+  /* Default: Liquid Glass Theme */
+  --theme-bg: linear-gradient(135deg, #090c0e 0%, #0b1315 100%);
+  --theme-card-bg: rgba(16, 21, 24, 0.8);
+  --theme-backdrop-blur: 20px;
+  --theme-backdrop-saturate: 130%;
+  --theme-border-start: rgba(255, 255, 255, 0.12);
+  --theme-border-end: rgba(255, 255, 255, 0.02);
+  --theme-accent: #00e5a3;
+  --theme-accent-rgb: 0, 229, 163;
+  --theme-text-primary: #ffffff;
+  --theme-text-secondary: #9ca3af;
+  --theme-text-tertiary: #6b7280;
+  
+  --theme-green: #00e5a3;
+  --theme-green-rgb: 0, 229, 163;
+  --theme-yellow: #f59e0b;
+  --theme-yellow-rgb: 245, 158, 11;
+  --theme-purple: #8b5cf6;
+  --theme-purple-rgb: 139, 92, 246;
+  --theme-red: #ef4444;
+  --theme-red-rgb: 239, 68, 68;
+}
+
+.theme-cyberpunk {
+  --theme-bg: linear-gradient(135deg, #05050a 0%, #0b0514 100%);
+  --theme-card-bg: rgba(10, 5, 20, 0.85);
+  --theme-backdrop-blur: 15px;
+  --theme-backdrop-saturate: 150%;
+  --theme-border-start: rgba(0, 255, 255, 0.3);
+  --theme-border-end: rgba(255, 0, 127, 0.15);
+  --theme-accent: #ff007f;
+  --theme-accent-rgb: 255, 0, 127;
+  --theme-text-primary: #ffffff;
+  --theme-text-secondary: #d1d5db;
+  --theme-text-tertiary: #9ca3af;
+
+  --theme-green: #00ffcc;
+  --theme-green-rgb: 0, 255, 204;
+  --theme-yellow: #ffcc00;
+  --theme-yellow-rgb: 255, 204, 0;
+  --theme-purple: #bd00ff;
+  --theme-purple-rgb: 189, 0, 255;
+  --theme-red: #ff0055;
+  --theme-red-rgb: 255, 0, 85;
+}
+
+.theme-solar {
+  --theme-bg: linear-gradient(135deg, #0f0702 0%, #1a0f05 100%);
+  --theme-card-bg: rgba(40, 20, 5, 0.65);
+  --theme-backdrop-blur: 25px;
+  --theme-backdrop-saturate: 110%;
+  --theme-border-start: rgba(245, 158, 11, 0.4);
+  --theme-border-end: rgba(245, 158, 11, 0.04);
+  --theme-accent: #f59e0b;
+  --theme-accent-rgb: 245, 158, 11;
+  --theme-text-primary: #ffffff;
+  --theme-text-secondary: #fcd34d;
+  --theme-text-tertiary: #b45309;
+
+  --theme-green: #10b981;
+  --theme-green-rgb: 16, 185, 129;
+  --theme-yellow: #fbbf24;
+  --theme-yellow-rgb: 251, 191, 36;
+  --theme-purple: #d946ef;
+  --theme-purple-rgb: 217, 70, 239;
+  --theme-red: #f43f5e;
+  --theme-red-rgb: 244, 63, 94;
+}
+
+.theme-space {
+  --theme-bg: linear-gradient(135deg, #0a0b10 0%, #030406 100%);
+  --theme-card-bg: rgba(13, 14, 18, 0.9);
+  --theme-backdrop-blur: 10px;
+  --theme-backdrop-saturate: 100%;
+  --theme-border-start: rgba(71, 85, 105, 0.25);
+  --theme-border-end: rgba(71, 85, 105, 0.05);
+  --theme-accent: #94a3b8;
+  --theme-accent-rgb: 148, 163, 184;
+  --theme-text-primary: #f8fafc;
+  --theme-text-secondary: #94a3b8;
+  --theme-text-tertiary: #475569;
+
+  --theme-green: #34d399;
+  --theme-green-rgb: 52, 211, 153;
+  --theme-yellow: #f59e0b;
+  --theme-yellow-rgb: 245, 158, 11;
+  --theme-purple: #818cf8;
+  --theme-purple-rgb: 129, 140, 248;
+  --theme-red: #f87171;
+  --theme-red-rgb: 248, 113, 113;
+}
+
+.theme-quantum {
+  --theme-bg: linear-gradient(135deg, #020f0f 0%, #041a1a 100%);
+  --theme-card-bg: rgba(6, 40, 40, 0.55);
+  --theme-backdrop-blur: 30px;
+  --theme-backdrop-saturate: 160%;
+  --theme-border-start: rgba(16, 185, 129, 0.4);
+  --theme-border-end: rgba(16, 185, 129, 0.05);
+  --theme-accent: #10b981;
+  --theme-accent-rgb: 16, 185, 129;
+  --theme-text-primary: #e6fffa;
+  --theme-text-secondary: #34d399;
+  --theme-text-tertiary: #047857;
+
+  --theme-green: #00ffaa;
+  --theme-green-rgb: 0, 255, 170;
+  --theme-yellow: #a3e635;
+  --theme-yellow-rgb: 163, 230, 53;
+  --theme-purple: #8b5cf6;
+  --theme-purple-rgb: 139, 92, 246;
+  --theme-red: #f43f5e;
+  --theme-red-rgb: 244, 63, 94;
+}
+
+@theme {
+  --font-sans: "SF Pro Text", "SF Pro Rounded", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-rounded: "SF Pro Rounded", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  
+  --color-theme-accent: var(--theme-accent);
+  --color-theme-text-primary: var(--theme-text-primary);
+  --color-theme-text-secondary: var(--theme-text-secondary);
+  --color-theme-text-tertiary: var(--theme-text-tertiary);
+  
+  --color-theme-green: var(--theme-green);
+  --color-theme-yellow: var(--theme-yellow);
+  --color-theme-purple: var(--theme-purple);
+  --color-theme-red: var(--theme-red);
+
+  --color-glass-card-bg: var(--theme-card-bg);
+  --shadow-prismatic: 0 8px 32px 0 rgba(0, 0, 0, 0.37), inset 0 1px 0 0 rgba(255, 255, 255, 0.15), inset 0 -1px 0 0 rgba(0, 0, 0, 0.2);
+}
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+    width: 100%;
+    font-family: var(--font-sans);
+    color: var(--theme-text-primary);
+    background: transparent;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+}
+
+@layer components {
+  /* Dynamic custom card layout */
+  .custom-glass-card {
+    backdrop-filter: blur(var(--theme-backdrop-blur)) saturate(var(--theme-backdrop-saturate));
+    -webkit-backdrop-filter: blur(var(--theme-backdrop-blur)) saturate(var(--theme-backdrop-saturate));
+    background: var(--theme-card-bg);
+    position: relative;
+    background-clip: padding-box;
+    overflow: hidden;
+  }
+
+  /* Specular border contour using mask rules */
+  .custom-glass-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(to bottom right, var(--theme-border-start), var(--theme-border-end));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  .text-blend {
+    mix-blend-mode: plus-lighter;
+  }
+
+  .interactive-hover-card {
+    transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.4s;
+  }
+  
+  .interactive-hover-card:hover {
+    transform: scale(1.02) translateY(-2px);
+    box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.45);
+  }
+  
+  /* Cyberpunk specific visual scanline */
+  .theme-cyberpunk .scanline {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(
+      rgba(18, 16, 16, 0) 50%, 
+      rgba(0, 0, 0, 0.25) 50%
+    ), linear-gradient(
+      90deg,
+      rgba(255, 0, 0, 0.06),
+      rgba(0, 255, 0, 0.02),
+      rgba(0, 0, 255, 0.06)
+    );
+    background-size: 100% 4px, 6px 100%;
+    pointer-events: none;
+    z-index: 1;
+    opacity: 0.15;
+  }
+}
+
+@layer utilities {
+  .min-target {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
